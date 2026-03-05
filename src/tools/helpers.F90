@@ -6,6 +6,7 @@ module m_helpers
   use m_particles
   use m_fields
   use m_qednamespace
+  use m_exchangearray, only: exchangeArray
   implicit none
 contains
   logical function numbersAreClose(number1, number2)
@@ -640,6 +641,163 @@ contains
       end do
     end do
   end subroutine computeEnergyMomentum
+
+  subroutine computeHeatFlux(s, component, reset, ds)
+    ! DEP_PRT [particle-dependent]
+    ! Computes the fluid-rest-frame heat flux for species s in direction `component`:
+    !   q_i = m_sp * Σ_p w_p * (u_{p,i} - γ_p * V_{i,s}(cell)) * contrib_q
+    ! where V_{i,s} = Σ_p v_{p,i}*w_p / Σ_p w_p is the number-density-weighted bulk 3-velocity.
+    ! Uses two particle passes:
+    !   Pass 1: deposit v_{p,i}*w → lg_arr and w → jy_buff, exchange both, compute V_i → jz_buff
+    !   Pass 2: deposit (u_{p,i} - γ_p*V_{i,s})*w*contrib_q → lg_arr (caller calls exchangeArray)
+    implicit none
+    integer, intent(in) :: s, component
+    logical, intent(in) :: reset
+    integer, optional, intent(in) :: ds
+    integer :: p, ti, tj, tk
+    integer(kind=2), pointer, contiguous :: pt_xi(:), pt_yi(:), pt_zi(:)
+    real, pointer, contiguous :: pt_u(:), pt_v(:), pt_w(:), pt_wei(:)
+    integer(kind=2) :: i, j, k, i1, i2, j1, j2, k1, k2, ds_
+    integer :: pow
+    real :: contrib_nd, contrib_q
+    real :: inv_gamma, gamma_p, vi_p
+
+    if (.not. present(ds)) then
+      ds_ = 2_2
+    else
+      ds_ = INT(ds, 2)
+    end if
+
+#ifdef oneD
+    pow = 1
+#elif defined(twoD)
+    pow = 2
+#elif defined(threeD)
+    pow = 3
+#endif
+
+    ! number-density-weighted contrib (cancels in numerator/denominator ratio for V_i)
+    contrib_nd = 1.0 / (2.0 * REAL(ds_) + 1.0)**pow
+    ! energy-flux contrib (includes mass for units matching T0X)
+    contrib_q = species(s) % m_sp / (2.0 * REAL(ds_) + 1.0)**pow
+
+    ! ----- Pass 1: compute V_{i,s}(cell) = (Σ v_i * w) / (Σ w) -----
+    lg_arr(:, :, :) = 0.0
+    jy_buff(:, :, :) = 0.0
+    do tk = 1, species(s) % tile_nz
+      do tj = 1, species(s) % tile_ny
+        do ti = 1, species(s) % tile_nx
+          pt_xi => species(s) % prtl_tile(ti, tj, tk) % xi
+          pt_yi => species(s) % prtl_tile(ti, tj, tk) % yi
+          pt_zi => species(s) % prtl_tile(ti, tj, tk) % zi
+          pt_wei => species(s) % prtl_tile(ti, tj, tk) % weight
+          pt_u => species(s) % prtl_tile(ti, tj, tk) % u
+          pt_v => species(s) % prtl_tile(ti, tj, tk) % v
+          pt_w => species(s) % prtl_tile(ti, tj, tk) % w
+          do p = 1, species(s) % prtl_tile(ti, tj, tk) % npart_sp
+            i = pt_xi(p); j = pt_yi(p); k = pt_zi(p)
+            inv_gamma = 1.0 / sqrt(1.0 + pt_u(p)**2 + pt_v(p)**2 + pt_w(p)**2)
+            if (component .eq. 1) then
+              vi_p = pt_u(p) * inv_gamma
+            else if (component .eq. 2) then
+              vi_p = pt_v(p) * inv_gamma
+            else
+              vi_p = pt_w(p) * inv_gamma
+            end if
+
+            i1 = 0; i2 = 0; j1 = 0; j2 = 0; k1 = 0; k2 = 0
+#if defined(oneD) || defined (twoD) || defined (threeD)
+            i1 = max(i - ds_, -NGHOST)
+            i2 = min(i + ds_, INT(this_meshblock % ptr % sx + NGHOST - 1, 2))
+#endif
+#if defined (twoD) || defined (threeD)
+            j1 = max(j - ds_, -NGHOST)
+            j2 = min(j + ds_, INT(this_meshblock % ptr % sy + NGHOST - 1, 2))
+#endif
+#if defined (threeD)
+            k1 = max(k - ds_, -NGHOST)
+            k2 = min(k + ds_, INT(this_meshblock % ptr % sz + NGHOST - 1, 2))
+#endif
+            do k = k1, k2
+              do j = j1, j2
+                do i = i1, i2
+                  lg_arr(i, j, k) = lg_arr(i, j, k) + vi_p * pt_wei(p) * contrib_nd
+                  jy_buff(i, j, k) = jy_buff(i, j, k) + pt_wei(p) * contrib_nd
+                end do
+              end do
+            end do
+          end do
+          pt_xi => null(); pt_yi => null(); pt_zi => null()
+          pt_u => null(); pt_v => null(); pt_w => null()
+          pt_wei => null()
+        end do
+      end do
+    end do
+
+    ! Exchange lg_arr (velocity numerator: Σ v_i * w) across MPI boundaries
+    call exchangeArray()
+    ! Save exchanged numerator to jz_buff
+    jz_buff(:, :, :) = lg_arr(:, :, :)
+    ! Move density denominator (Σ w) to lg_arr and exchange
+    lg_arr(:, :, :) = jy_buff(:, :, :)
+    call exchangeArray()
+    ! V_{i,s}(cell) = numerator / denominator, stored in jz_buff
+    jz_buff(:, :, :) = jz_buff(:, :, :) / (lg_arr(:, :, :) + TINYFLD)
+
+    ! ----- Pass 2: deposit q_i = Σ w * (u_i - γ * V_i(cell)) * contrib_q -----
+    lg_arr(:, :, :) = 0.0
+    do tk = 1, species(s) % tile_nz
+      do tj = 1, species(s) % tile_ny
+        do ti = 1, species(s) % tile_nx
+          pt_xi => species(s) % prtl_tile(ti, tj, tk) % xi
+          pt_yi => species(s) % prtl_tile(ti, tj, tk) % yi
+          pt_zi => species(s) % prtl_tile(ti, tj, tk) % zi
+          pt_wei => species(s) % prtl_tile(ti, tj, tk) % weight
+          pt_u => species(s) % prtl_tile(ti, tj, tk) % u
+          pt_v => species(s) % prtl_tile(ti, tj, tk) % v
+          pt_w => species(s) % prtl_tile(ti, tj, tk) % w
+          do p = 1, species(s) % prtl_tile(ti, tj, tk) % npart_sp
+            i = pt_xi(p); j = pt_yi(p); k = pt_zi(p)
+            inv_gamma = 1.0 / sqrt(1.0 + pt_u(p)**2 + pt_v(p)**2 + pt_w(p)**2)
+            gamma_p = 1.0 / inv_gamma
+            ! u_i - γ * V_{i,s}(cell): deviation from bulk motion in 4-velocity units
+            if (component .eq. 1) then
+              vi_p = pt_u(p) - gamma_p * jz_buff(i, j, k)
+            else if (component .eq. 2) then
+              vi_p = pt_v(p) - gamma_p * jz_buff(i, j, k)
+            else
+              vi_p = pt_w(p) - gamma_p * jz_buff(i, j, k)
+            end if
+
+            i1 = 0; i2 = 0; j1 = 0; j2 = 0; k1 = 0; k2 = 0
+#if defined(oneD) || defined (twoD) || defined (threeD)
+            i1 = max(i - ds_, -NGHOST)
+            i2 = min(i + ds_, INT(this_meshblock % ptr % sx + NGHOST - 1, 2))
+#endif
+#if defined (twoD) || defined (threeD)
+            j1 = max(j - ds_, -NGHOST)
+            j2 = min(j + ds_, INT(this_meshblock % ptr % sy + NGHOST - 1, 2))
+#endif
+#if defined (threeD)
+            k1 = max(k - ds_, -NGHOST)
+            k2 = min(k + ds_, INT(this_meshblock % ptr % sz + NGHOST - 1, 2))
+#endif
+            do k = k1, k2
+              do j = j1, j2
+                do i = i1, i2
+                  lg_arr(i, j, k) = lg_arr(i, j, k) + vi_p * pt_wei(p) * contrib_q
+                end do
+              end do
+            end do
+          end do
+          pt_xi => null(); pt_yi => null(); pt_zi => null()
+          pt_u => null(); pt_v => null(); pt_w => null()
+          pt_wei => null()
+        end do
+      end do
+    end do
+    ! Note: caller is responsible for calling exchangeArray() after this subroutine
+  end subroutine computeHeatFlux
 
   subroutine computeFluidVelocity(component, ds)
     ! DEP_PRT [particle-dependent]

@@ -7,7 +7,7 @@ module m_outputlogistics
   use m_particles
   use m_fields
   use m_readinput, only: getInput
-  use m_helpers, only: computeDensity, computeMomentum, computeEnergyMomentum, computeNpart, computeFluidVelocity, computeFluidDensity, computePrtCurr
+  use m_helpers, only: computeDensity, computeMomentum, computeEnergyMomentum, computeNpart, computeFluidVelocity, computeFluidDensity, computePrtCurr, computeHeatFlux
   use m_helpers, only: interpFromFaces, interpFromEdges
   use m_exchangearray, only: exchangeArray
   use m_qednamespace
@@ -84,6 +84,7 @@ contains
     call getInput('output', 'write_T0i', T0i_output_enable, .false.)
     call getInput('output', 'write_Tii', Tii_output_enable, .false.)
     call getInput('output', 'write_Tij', Tij_output_enable, .false.)
+    call getInput('output', 'write_heat_flux', Qheat_output_enable, .false.)
 
 #if defined(HDF5) && defined(MPI08)
     h5comm = MPI_COMM_WORLD % MPI_VAL
@@ -416,6 +417,20 @@ contains
         fld_vars(n_fld_vars + 3) = 'TYZ'//STR(s)
         n_fld_vars = n_fld_vars + 3
       end if
+      if (Qheat_output_enable .and. (species(s) % m_sp .gt. 0)) then
+#if defined(oneD) || defined(twoD) || defined(threeD)
+        fld_vars(n_fld_vars + 1) = 'Q0X'//STR(s)
+        n_fld_vars = n_fld_vars + 1
+#endif
+#if defined(twoD) || defined(threeD)
+        fld_vars(n_fld_vars + 1) = 'Q0Y'//STR(s)
+        n_fld_vars = n_fld_vars + 1
+#endif
+#if defined(threeD)
+        fld_vars(n_fld_vars + 1) = 'Q0Z'//STR(s)
+        n_fld_vars = n_fld_vars + 1
+#endif
+      end if
     end do
 
     fld_vars(n_fld_vars + 1:n_fld_vars + 1 + 12 - 1) = &
@@ -570,7 +585,8 @@ contains
            (fld_var(1:4) .ne. 'jprt') .and. &
            (fld_var(1:4) .ne. 'nprt') .and. &
            (fld_var(1:3) .ne. 'vel') .and. &
-           (fld_var(1:4) .ne. 'dgca')) .or. &
+           (fld_var(1:4) .ne. 'dgca') .and. &
+           (fld_var(1:2) .ne. 'Q0')) .or. &
           (.not. writing_lgarrQ)) then
         call throwError("ERROR: unrecognized `fldname`: "//trim(fld_var))
       else
@@ -694,6 +710,20 @@ contains
       writing_lgarrQ = .true.
       s = STRtoINT(fldname(5:5))
       call computeMomentum(s, component=4, reset=.true., ds=output_dens_smooth)
+      call exchangeArray()
+    else if (fldname(1:2) .eq. 'Q0') then
+      ! fluid-rest-frame heat flux q_i for species s
+      writing_lgarrQ = .true.
+      s = STRtoINT(fldname(4:4))
+      if (fldname(3:3) .eq. 'X') then
+        call computeHeatFlux(s, component=1, reset=.true., ds=output_dens_smooth)
+      else if (fldname(3:3) .eq. 'Y') then
+        call computeHeatFlux(s, component=2, reset=.true., ds=output_dens_smooth)
+      else if (fldname(3:3) .eq. 'Z') then
+        call computeHeatFlux(s, component=3, reset=.true., ds=output_dens_smooth)
+      else
+        call throwError('ERROR: unknown component in `Q0` output:'//trim(fldname(3:3))//'.')
+      end if
       call exchangeArray()
     else
       writing_lgarrQ = .false.
